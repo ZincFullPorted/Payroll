@@ -113,6 +113,15 @@ app.post("/webhook", async (req, res) => {
       const sig = tx.signature || tx.transactionSignature;
       if (!sig || recentlySeen(sig)) continue;
 
+      console.log("TX keys:", Object.keys(tx || {}));
+console.log("type:", tx.type, "source:", tx.source);
+console.log("has swap:", Boolean(tx.events?.swap));
+if (tx.events?.swap) {
+  const swapDbg = tx.events.swap;
+  console.log("inputs mints:", (swapDbg.tokenInputs || []).map(t => t.mint));
+  console.log("outputs mints:", (swapDbg.tokenOutputs || []).map(t => t.mint));
+}
+
       // Some payloads may not have tx.type exactly "SWAP" – keep it, but we also require events.swap
       const swap = tx.events?.swap;
       if (!swap) continue;
@@ -168,3 +177,4 @@ client.once("ready", async () => {
 client.login(DISCORD_BOT_TOKEN);
 
 app.listen(PORT, () => console.log(`Listening on :${PORT}`));
+
