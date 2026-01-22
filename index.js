@@ -1,3 +1,22 @@
+/**
+ * index.js — Solana “buy bot” for Discord using Helius Advanced webhooks
+ *
+ * Endpoints:
+ *  - GET  /health  -> "ok"
+ *  - POST /test    -> posts a test embed to Discord
+ *  - POST /webhook -> receives Helius Advanced tx payloads, posts BUY/SELL alerts
+ *
+ * Required env vars (Render -> Environment):
+ *  - DISCORD_BOT_TOKEN
+ *  - DISCORD_CHANNEL_ID
+ *  - TOKEN_MINT
+ *
+ * Optional env vars:
+ *  - HELIUS_AUTH   (string; if set, must match incoming Authorization header)
+ *  - MIN_SOL       (default 0.01) ignore tiny swaps when SOL amount is known
+ *  - POST_SELLS    ("true" to post sells too; default false -> only buys)
+ */
+
 require("dotenv").config();
 const express = require("express");
 const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
@@ -5,17 +24,17 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 // ===== ENV =====
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
-const TOKEN_MINT = process.env.TOKEN_MINT; // your mint
-const HELIUS_AUTH = process.env.HELIUS_AUTH; // optional
+const TOKEN_MINT = process.env.TOKEN_MINT;
+const HELIUS_AUTH = process.env.HELIUS_AUTH || "";
 const MIN_SOL = Number(process.env.MIN_SOL || 0.01);
+const POST_SELLS = String(process.env.POST_SELLS || "false").toLowerCase() === "true";
+
+// Render sets PORT automatically; keep fallback for local.
 const PORT = process.env.PORT || 3000;
 
-if (!DISCORD_BOT_TOKEN || !DISCORD_CHANNEL_ID) {
-  console.error("Missing DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID");
+if (!DISCORD_BOT_TOKEN || !DISCORD_CHANNEL_ID || !TOKEN_MINT) {
+  console.error("Missing env vars. Required: DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, TOKEN_MINT");
   process.exit(1);
-}
-if (!TOKEN_MINT) {
-  console.warn("Warning: TOKEN_MINT is not set. Webhook BUY detection will not work.");
 }
 
 // ===== DISCORD =====
@@ -29,11 +48,18 @@ function shortAddr(a = "") {
   return a.length > 8 ? `${a.slice(0, 4)}…${a.slice(-4)}` : a;
 }
 
+function lamportsToSol(lamports) {
+  const n = Number(lamports || 0);
+  if (!Number.isFinite(n)) return 0;
+  return n / 1e9;
+}
+
 function rawToNumber(rawTokenAmount) {
   // rawTokenAmount: { tokenAmount: "123456", decimals: 6 }
   if (!rawTokenAmount) return 0;
   const s = String(rawTokenAmount.tokenAmount ?? "0");
   const d = Number(rawTokenAmount.decimals ?? 0);
+
   const neg = s.startsWith("-");
   const digits = neg ? s.slice(1) : s;
 
@@ -46,12 +72,21 @@ function rawToNumber(rawTokenAmount) {
   return neg ? -n : n;
 }
 
-// ===== DEDUPE (Helius retries can cause duplicates) =====
-const seen = new Map(); // sig -> timestamp
+function tokenAmt(t) {
+  // Helius can include either tokenAmount or rawTokenAmount (or both)
+  if (!t) return 0;
+  if (typeof t.tokenAmount === "number") return t.tokenAmount;
+  if (typeof t.tokenAmount === "string") return Number(t.tokenAmount);
+  if (t.rawTokenAmount) return rawToNumber(t.rawTokenAmount);
+  return 0;
+}
+
+// Dedupe: Helius may retry / send duplicates.
+const seen = new Map(); // signature -> timestamp
 function recentlySeen(sig) {
   const now = Date.now();
   const last = seen.get(sig);
-  if (last && now - last < 10 * 60 * 1000) return true; // 10 mins
+  if (last && now - last < 10 * 60 * 1000) return true; // 10 min
   seen.set(sig, now);
 
   // cleanup
@@ -63,11 +98,9 @@ function recentlySeen(sig) {
 
 // ===== EXPRESS =====
 const app = express();
-
-// IMPORTANT: parse JSON body from Helius
 app.use(express.json({ limit: "2mb" }));
 
-// Log all incoming requests (helps debug whether Helius is hitting you)
+// Log every request (useful for debugging webhook delivery)
 app.use((req, res, next) => {
   console.log("REQ", new Date().toISOString(), req.method, req.path);
   next();
@@ -79,30 +112,30 @@ app.post("/test", async (req, res) => {
   try {
     const channel = await getChannel();
     const embed = new EmbedBuilder()
-      .setTitle("Test Buy Alert ✅")
+      .setTitle("Test Buy Bot ✅")
       .setDescription("If you see this, Render → Discord posting works.")
       .setTimestamp(new Date());
+
     await channel.send({ embeds: [embed] });
     res.json({ ok: true });
   } catch (e) {
-    console.error(e);
+    console.error("Test error:", e);
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// ===== HELIUS ADVANCED WEBHOOK (BUY ONLY) =====
+// ===== HELIUS ADVANCED WEBHOOK =====
 app.post("/webhook", async (req, res) => {
-  // Respond fast so Helius doesn't retry due to slow response
-  // We'll do work after responding
+  // Respond immediately so Helius doesn't retry due to slow processing
   res.status(200).send("ok");
 
   try {
     console.log("WEBHOOK HIT", new Date().toISOString());
 
-    // Auth (Helius sends it as Authorization header)
-    const auth = req.headers["authorization"];
+    // Optional auth check: Helius sends configured auth header in Authorization
+    const auth = req.headers["authorization"] || "";
     if (HELIUS_AUTH && auth !== HELIUS_AUTH) {
-      console.log("WEBHOOK unauthorized (Authorization header mismatch)");
+      console.log("Unauthorized webhook: Authorization mismatch");
       return;
     }
 
@@ -113,51 +146,52 @@ app.post("/webhook", async (req, res) => {
       const sig = tx.signature || tx.transactionSignature;
       if (!sig || recentlySeen(sig)) continue;
 
-      console.log("TX keys:", Object.keys(tx || {}));
-console.log("type:", tx.type, "source:", tx.source);
-console.log("has swap:", Boolean(tx.events?.swap));
-if (tx.events?.swap) {
-  const swapDbg = tx.events.swap;
-  console.log("inputs mints:", (swapDbg.tokenInputs || []).map(t => t.mint));
-  console.log("outputs mints:", (swapDbg.tokenOutputs || []).map(t => t.mint));
-}
-
-      // Some payloads may not have tx.type exactly "SWAP" – keep it, but we also require events.swap
       const swap = tx.events?.swap;
-      if (!swap) continue;
+      if (!swap) continue; // ignore non-swap payloads
 
-      // BUY = your mint appears in tokenOutputs, not in tokenInputs
-      const out = (swap.tokenOutputs || []).find((t) => t.mint === TOKEN_MINT);
-      const inp = (swap.tokenInputs || []).find((t) => t.mint === TOKEN_MINT);
-      if (!out || inp) continue; // buys only
+      // Net your mint across inputs/outputs
+      const inAmt = (swap.tokenInputs || [])
+        .filter((t) => t.mint === TOKEN_MINT)
+        .reduce((s, t) => s + tokenAmt(t), 0);
 
-      const tokensReceived = rawToNumber(out.rawTokenAmount);
+      const outAmt = (swap.tokenOutputs || [])
+        .filter((t) => t.mint === TOKEN_MINT)
+        .reduce((s, t) => s + tokenAmt(t), 0);
 
-      // SOL spent (nativeInput.amount is lamports)
-      let solSpent = 0;
-      if (swap.nativeInput?.amount) solSpent = Number(swap.nativeInput.amount) / 1e9;
+      const net = outAmt - inAmt; // + = BUY, - = SELL
+      if (net === 0) continue;
 
-      // Optional filter
-      if (solSpent && solSpent < MIN_SOL) continue;
+      const side = net > 0 ? "BUY" : "SELL";
+      if (side === "SELL" && !POST_SELLS) continue;
 
-      const buyer = tx.feePayer || out.userAccount || "unknown";
-      const source = tx.source || tx.type || "SWAP";
-      const price = solSpent && tokensReceived ? solSpent / tokensReceived : null;
+      // SOL spent/received. For BUYs: usually nativeInput. For SELLs: usually nativeOutput.
+      const solIn = lamportsToSol(swap.nativeInput?.amount);
+      const solOut = lamportsToSol(swap.nativeOutput?.amount);
+      const sol = side === "BUY" ? solIn : solOut;
+
+      // Optional dust filter when SOL is known
+      if (sol && sol < MIN_SOL) continue;
+
+      const tokens = Math.abs(net);
+      const buyer = tx.feePayer || tx.signer || "unknown";
+      const source = tx.source || tx.type || "JUPITER";
 
       const whale =
-        solSpent >= 10 ? "🐋" :
-        solSpent >= 2 ? "🦈" :
-        solSpent >= 0.5 ? "🐬" : "🟢";
+        sol >= 10 ? "🐋" :
+        sol >= 2 ? "🦈" :
+        sol >= 0.5 ? "🐬" : (side === "BUY" ? "🟢" : "🔴");
+
+      const price = sol && tokens ? sol / tokens : null;
 
       const embed = new EmbedBuilder()
-        .setTitle(`${whale} BUY`)
+        .setTitle(`${whale} ${side}`)
         .setDescription(
-          `**Mint:** \`${shortAddr(TOKEN_MINT)}\`\n` +
-          `**Received:** ${Number(tokensReceived).toLocaleString()} tokens\n` +
-          (solSpent ? `**Spent:** ${solSpent.toFixed(4)} SOL\n` : "") +
+          `**Token:** \`${shortAddr(TOKEN_MINT)}\`\n` +
+          `**Tokens:** ${Number(tokens).toLocaleString()}\n` +
+          (sol ? `**SOL:** ${sol.toFixed(4)}\n` : "") +
           (price ? `**Price:** ${price.toExponential(6)} SOL/token\n` : "") +
-          `**Buyer:** \`${shortAddr(buyer)}\`\n` +
-          `**Source:** ${source}\`\n`.replace("`\n", "\n") + // tiny cleanup if source not wrapped
+          `**Wallet:** \`${shortAddr(buyer)}\`\n` +
+          `**Source:** ${source}\n` +
           `**Tx:** https://solscan.io/tx/${sig}`
         )
         .setTimestamp(new Date());
@@ -165,7 +199,7 @@ if (tx.events?.swap) {
       await channel.send({ embeds: [embed] });
     }
   } catch (e) {
-    console.error("Webhook error:", e);
+    console.error("Webhook handler error:", e);
   }
 });
 
@@ -177,4 +211,3 @@ client.once("ready", async () => {
 client.login(DISCORD_BOT_TOKEN);
 
 app.listen(PORT, () => console.log(`Listening on :${PORT}`));
-
