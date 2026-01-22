@@ -202,7 +202,18 @@ app.post("/webhook", async (req, res) => {
     console.error("Webhook handler error:", e);
   }
 });
+process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 
+client.once("ready", () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
+
+console.log("Attempting Discord login...");
+client.login(DISCORD_BOT_TOKEN).catch((e) => {
+  console.error("Discord login FAILED:", e);
+  process.exit(1);
+});
 // ===== START =====
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -211,3 +222,4 @@ client.once("ready", async () => {
 client.login(DISCORD_BOT_TOKEN);
 
 app.listen(PORT, () => console.log(`Listening on :${PORT}`));
+
