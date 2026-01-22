@@ -148,6 +148,11 @@ app.post("/webhook", async (req, res) => {
 
       const swap = tx.events?.swap;
       if (!swap) continue; // ignore non-swap payloads
+      
+const ins = (swap.tokenInputs || []).map(t => t.mint);
+const outs = (swap.tokenOutputs || []).map(t => t.mint);
+console.log("SWAP mints in:", ins);
+console.log("SWAP mints out:", outs);
 
       // Net your mint across inputs/outputs
       const inAmt = (swap.tokenInputs || [])
@@ -222,4 +227,5 @@ client.once("ready", async () => {
 client.login(DISCORD_BOT_TOKEN);
 
 app.listen(PORT, () => console.log(`Listening on :${PORT}`));
+
 
