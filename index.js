@@ -5,16 +5,17 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 // ===== ENV =====
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
-const TOKEN_MINT = process.env.TOKEN_MINT; // 998mgH4...
+const TOKEN_MINT = process.env.TOKEN_MINT; // your mint
 const HELIUS_AUTH = process.env.HELIUS_AUTH; // optional
 const MIN_SOL = Number(process.env.MIN_SOL || 0.01);
-
-// Render sets PORT automatically
 const PORT = process.env.PORT || 3000;
 
 if (!DISCORD_BOT_TOKEN || !DISCORD_CHANNEL_ID) {
   console.error("Missing DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID");
   process.exit(1);
+}
+if (!TOKEN_MINT) {
+  console.warn("Warning: TOKEN_MINT is not set. Webhook BUY detection will not work.");
 }
 
 // ===== DISCORD =====
@@ -29,6 +30,7 @@ function shortAddr(a = "") {
 }
 
 function rawToNumber(rawTokenAmount) {
+  // rawTokenAmount: { tokenAmount: "123456", decimals: 6 }
   if (!rawTokenAmount) return 0;
   const s = String(rawTokenAmount.tokenAmount ?? "0");
   const d = Number(rawTokenAmount.decimals ?? 0);
@@ -44,25 +46,33 @@ function rawToNumber(rawTokenAmount) {
   return neg ? -n : n;
 }
 
-// simple dedupe for retries
-const seen = new Map();
+// ===== DEDUPE (Helius retries can cause duplicates) =====
+const seen = new Map(); // sig -> timestamp
 function recentlySeen(sig) {
   const now = Date.now();
   const last = seen.get(sig);
-  if (last && now - last < 10 * 60 * 1000) return true;
+  if (last && now - last < 10 * 60 * 1000) return true; // 10 mins
   seen.set(sig, now);
+
+  // cleanup
   if (seen.size > 5000) {
     for (const [k, t] of seen) if (now - t > 10 * 60 * 1000) seen.delete(k);
   }
   return false;
 }
 
-// ===== EXPRESS (THIS WAS MISSING/TOO LOW IN YOUR FILE) =====
+// ===== EXPRESS =====
 const app = express();
+
+// IMPORTANT: parse JSON body from Helius
+app.use(express.json({ limit: "2mb" }));
+
+// Log all incoming requests (helps debug whether Helius is hitting you)
 app.use((req, res, next) => {
   console.log("REQ", new Date().toISOString(), req.method, req.path);
   next();
 });
+
 app.get("/health", (req, res) => res.send("ok"));
 
 app.post("/test", async (req, res) => {
@@ -81,13 +91,20 @@ app.post("/test", async (req, res) => {
 });
 
 // ===== HELIUS ADVANCED WEBHOOK (BUY ONLY) =====
-console.log("WEBHOOK HIT", new Date().toISOString());
-  try {
-    // If you set an auth header in Helius, it typically arrives as Authorization
-    const auth = req.headers["authorization"];
-    if (HELIUS_AUTH && auth !== HELIUS_AUTH) return res.status(401).send("Unauthorized");
+app.post("/webhook", async (req, res) => {
+  // Respond fast so Helius doesn't retry due to slow response
+  // We'll do work after responding
+  res.status(200).send("ok");
 
-    if (!TOKEN_MINT) return res.status(400).send("Missing TOKEN_MINT");
+  try {
+    console.log("WEBHOOK HIT", new Date().toISOString());
+
+    // Auth (Helius sends it as Authorization header)
+    const auth = req.headers["authorization"];
+    if (HELIUS_AUTH && auth !== HELIUS_AUTH) {
+      console.log("WEBHOOK unauthorized (Authorization header mismatch)");
+      return;
+    }
 
     const txs = Array.isArray(req.body) ? req.body : [req.body];
     const channel = await getChannel();
@@ -96,28 +113,26 @@ console.log("WEBHOOK HIT", new Date().toISOString());
       const sig = tx.signature || tx.transactionSignature;
       if (!sig || recentlySeen(sig)) continue;
 
-      // Helius Advanced usually sets type + events.swap for SWAPs
-      if (tx.type !== "SWAP") continue;
-
+      // Some payloads may not have tx.type exactly "SWAP" – keep it, but we also require events.swap
       const swap = tx.events?.swap;
       if (!swap) continue;
 
-      const out = (swap.tokenOutputs || []).find(t => t.mint === TOKEN_MINT);
-      const inp = (swap.tokenInputs || []).find(t => t.mint === TOKEN_MINT);
-
-      // BUY only: received your token (output), not spending it (input)
-      if (!out || inp) continue;
+      // BUY = your mint appears in tokenOutputs, not in tokenInputs
+      const out = (swap.tokenOutputs || []).find((t) => t.mint === TOKEN_MINT);
+      const inp = (swap.tokenInputs || []).find((t) => t.mint === TOKEN_MINT);
+      if (!out || inp) continue; // buys only
 
       const tokensReceived = rawToNumber(out.rawTokenAmount);
 
-      // SOL spent (nativeInput amount is lamports)
+      // SOL spent (nativeInput.amount is lamports)
       let solSpent = 0;
       if (swap.nativeInput?.amount) solSpent = Number(swap.nativeInput.amount) / 1e9;
 
+      // Optional filter
       if (solSpent && solSpent < MIN_SOL) continue;
 
       const buyer = tx.feePayer || out.userAccount || "unknown";
-      const source = tx.source || "SWAP";
+      const source = tx.source || tx.type || "SWAP";
       const price = solSpent && tokensReceived ? solSpent / tokensReceived : null;
 
       const whale =
@@ -128,22 +143,20 @@ console.log("WEBHOOK HIT", new Date().toISOString());
       const embed = new EmbedBuilder()
         .setTitle(`${whale} BUY`)
         .setDescription(
-          `**Received:** ${tokensReceived.toLocaleString()} tokens\n` +
+          `**Mint:** \`${shortAddr(TOKEN_MINT)}\`\n` +
+          `**Received:** ${Number(tokensReceived).toLocaleString()} tokens\n` +
           (solSpent ? `**Spent:** ${solSpent.toFixed(4)} SOL\n` : "") +
           (price ? `**Price:** ${price.toExponential(6)} SOL/token\n` : "") +
           `**Buyer:** \`${shortAddr(buyer)}\`\n` +
-          `**Source:** ${source}\n` +
+          `**Source:** ${source}\`\n`.replace("`\n", "\n") + // tiny cleanup if source not wrapped
           `**Tx:** https://solscan.io/tx/${sig}`
         )
         .setTimestamp(new Date());
 
       await channel.send({ embeds: [embed] });
     }
-
-    res.send("ok");
   } catch (e) {
-    console.error(e);
-    res.status(500).send("error");
+    console.error("Webhook error:", e);
   }
 });
 
@@ -155,4 +168,3 @@ client.once("ready", async () => {
 client.login(DISCORD_BOT_TOKEN);
 
 app.listen(PORT, () => console.log(`Listening on :${PORT}`));
-
