@@ -59,8 +59,10 @@ function recentlySeen(sig) {
 
 // ===== EXPRESS (THIS WAS MISSING/TOO LOW IN YOUR FILE) =====
 const app = express();
-app.use(express.json({ limit: "2mb" }));
-
+app.use((req, res, next) => {
+  console.log("REQ", new Date().toISOString(), req.method, req.path);
+  next();
+});
 app.get("/health", (req, res) => res.send("ok"));
 
 app.post("/test", async (req, res) => {
@@ -79,7 +81,7 @@ app.post("/test", async (req, res) => {
 });
 
 // ===== HELIUS ADVANCED WEBHOOK (BUY ONLY) =====
-app.post("/webhook", async (req, res) => {
+console.log("WEBHOOK HIT", new Date().toISOString());
   try {
     // If you set an auth header in Helius, it typically arrives as Authorization
     const auth = req.headers["authorization"];
@@ -153,3 +155,4 @@ client.once("ready", async () => {
 client.login(DISCORD_BOT_TOKEN);
 
 app.listen(PORT, () => console.log(`Listening on :${PORT}`));
+
